@@ -27,6 +27,7 @@ app.get('/', async(req, res) => {
 })
 
 app.post('/go', async (req, res) => {
+    console.log(`1. Received POST request`);
     try {
         const {
             message,
@@ -38,8 +39,10 @@ app.post('/go', async (req, res) => {
             numberOfSimilarityResults = 2,
             numberOfPagesToScan = 4
         } = req.body;
-    
+        console.log(`2. Destructured request data`);
+
         async function rephraseInput(inputString) {
+            console.log(`4. Rephrasing input`);
             const groqResponse = await openai.chat.completions.create({
                 model: "mixtral-8x7b-32768",
                 messages: [
@@ -53,12 +56,27 @@ app.post('/go', async (req, res) => {
         }
         
         async function searchEngineForSources(message) {
-            const loader = new BraveSearch({ apiKey: process.env.BRAVE_SEARCH_API_KEY });
-            const rephrasedMessage = await rephraseInput(message);
-            const docs = await loader.call(rephrasedMessage, { count: numberOfPagesToScan });
-            const normalizedData = normalizeData(docs);
-            return await Promise.all(normalizedData.map(fetchAndProcess));
-        }
+            console.log(`3. Initializing Search Engine Process`);
+            try {
+                const loader = new BraveSearch({ apiKey: process.env.BRAVE_SEARCH_API_KEY });
+                const rephrasedMessage = await rephraseInput(message);
+                console.log(`6. Rephrased message and got documents from BraveSearch ${rephrasedMessage}`);
+        
+                const docs = await loader.call(rephrasedMessage, { count: numberOfPagesToScan });        
+                const normalizedData = normalizeData(docs);
+                return await Promise.all(normalizedData.map(async (data) => {
+                    try {
+                        return await fetchAndProcess(data);
+                    } catch (error) {
+                        console.error(`Error fetching and processing data for ${data}:`, error);
+                        return null;
+                    }
+                }));
+            } catch (error) {
+                console.error(`Error in searchEngineForSources function:`, error);
+                return [];
+            }
+        }        
         
         function normalizeData(docs) {
             return JSON.parse(docs)
@@ -68,19 +86,36 @@ app.post('/go', async (req, res) => {
         }
         
         const fetchPageContent = async (link) => {
+            console.log(`7. Fetching page content for ${link}`);
             try {
-                const response = await fetch(link);
+                console.log(`Fetching content from URL: ${link}`);
+                
+                const requestOptions = {
+                    method: 'GET',
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0',
+                        'Accept': 'text/html',
+                    }
+                };
+        
+                const response = await fetch(link, requestOptions);
+                
                 if (!response.ok) 
-                {
+                    {
+                    console.error(`HTTP error ${response.status}: ${response.statusText} for ${link}`);
                     return "";
                 }
-                const text = await response.text();
+        
+                const text = await response.text();        
+                console.log(`Fetched content length: ${text.length}`);        
                 return extractMainContent(text, link);
-            } catch (error) {
+            } 
+            catch (error) {
                 console.error(`Error fetching page content for ${link}:`, error);
                 return '';
             }
         };
+            
         
         const fetchAndProcess = async (item) => {
             const htmlContent = await fetchPageContent(item.link);
@@ -88,10 +123,12 @@ app.post('/go', async (req, res) => {
             const splitText = await new RecursiveCharacterTextSplitter({ chunkSize: textChunkSize, chunkOverlap: textChunkOverlap }).splitText(htmlContent);
             const vectorStore = await MemoryVectorStore.fromTexts(splitText, { link: item.link, title: item.title }, embeddings);
             vectorCount++;
+            console.log(`9. Processed ${vectorCount} sources for ${item.link}`);
             return await vectorStore.similaritySearch(message, numberOfSimilarityResults);
         };
         
         function extractMainContent(html, link) {
+            console.log(`8. Extracting main content from HTML for ${link}`);
             const $ = html.length ? cheerio.load(html) : null
             $("script, style, head, nav, footer, iframe, img").remove();
             return $("body").text().replace(/\s+/g, " ").trim();
@@ -107,6 +144,8 @@ app.post('/go', async (req, res) => {
             })
                 .filter((doc, index, self) => self.findIndex(d => d.link === doc.link) === index)
         );
+
+        console.log(`10. RAG complete sources and preparing response content`);
         const chatCompletion = await openai.chat.completions.create({
             messages:
                 [{
@@ -117,7 +156,9 @@ app.post('/go', async (req, res) => {
                 { role: "user", content: ` - Here are the top results from a similarity search: ${JSON.stringify(sources)}. ` },
                 ], stream: true, model: "mixtral-8x7b-32768"
         });
+        console.log(`11. Sent content to Groq for chat completion.`);
         let responseTotal = "";
+        console.log(`12. Streaming response from Groq... \n`);
         for await (const chunk of chatCompletion) {
             if (chunk.choices[0].delta && chunk.choices[0].finish_reason !== "stop") 
             {
